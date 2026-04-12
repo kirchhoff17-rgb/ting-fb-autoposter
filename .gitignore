@@ -1,0 +1,9 @@
+.env
+google_credentials.json
+post_log.txt
+*_posts.txt
+*_output.txt
+*.json
+__pycache__/
+*.pyc
+.playwright-mcp/
