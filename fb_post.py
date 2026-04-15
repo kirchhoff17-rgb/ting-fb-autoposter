@@ -130,15 +130,16 @@ def generate_content(topic: str) -> str:
     return msg.content[0].text.strip()
 
 
-def post_to_facebook(message: str, photo_id: str = None, dry_run: bool = False) -> dict:
+def post_to_facebook(message: str, photo_ids: list = None, dry_run: bool = False) -> dict:
     if dry_run:
-        log(f"[DRY RUN] 預計發文{'（含圖片）' if photo_id else ''}：\n{message}")
+        count = len(photo_ids) if photo_ids else 0
+        log(f"[DRY RUN] 預計發文（{count} 張圖片）：\n{message}")
         return {"dry_run": True, "id": "dry_run"}
 
     url = f"https://graph.facebook.com/v19.0/{FB_PAGE_ID}/feed"
     payload = {"message": message, "access_token": FB_PAGE_ACCESS_TOKEN}
-    if photo_id:
-        payload["attached_media"] = json.dumps([{"media_fbid": photo_id}])
+    if photo_ids:
+        payload["attached_media"] = json.dumps([{"media_fbid": pid} for pid in photo_ids])
 
     resp = requests.post(url, data=payload)
     return resp.json()
@@ -191,23 +192,26 @@ def main():
                 log(f"Claude 生成失敗：{e}，跳過此列")
                 continue
 
-        # 處理圖片
-        photo_id = None
+        # 處理圖片（G 欄可填多個 Drive 連結，每行一個）
+        photo_ids = []
         if image_ref and not dry_run:
-            file_id = extract_drive_file_id(image_ref)
-            if file_id:
-                log(f"下載 Drive 圖片：{file_id}")
-                try:
-                    img_bytes, mime = download_from_drive(file_id)
-                    photo_id = upload_photo_to_fb(img_bytes, mime)
-                    log(f"圖片上傳成功，photo_id: {photo_id}")
-                except Exception as e:
-                    log(f"圖片處理失敗：{e}，改發純文字")
-            else:
-                log(f"無法解析圖片連結：{image_ref}，改發純文字")
+            image_urls = [u.strip() for u in image_ref.splitlines() if u.strip()]
+            for img_url in image_urls:
+                file_id = extract_drive_file_id(img_url)
+                if file_id:
+                    log(f"下載 Drive 圖片：{file_id}")
+                    try:
+                        img_bytes, mime = download_from_drive(file_id)
+                        pid = upload_photo_to_fb(img_bytes, mime)
+                        photo_ids.append(pid)
+                        log(f"圖片上傳成功，photo_id: {pid}")
+                    except Exception as e:
+                        log(f"圖片處理失敗：{e}，略過此圖")
+                else:
+                    log(f"無法解析圖片連結：{img_url}，略過")
 
         # 發文
-        result = post_to_facebook(content, photo_id=photo_id, dry_run=dry_run)
+        result = post_to_facebook(content, photo_ids=photo_ids, dry_run=dry_run)
 
         if "id" in result and not dry_run:
             post_id = result["id"]
