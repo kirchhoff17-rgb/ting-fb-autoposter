@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-一方石 FB 自動發文腳本
+一方石自動發文腳本（FB + Threads）
 流程：讀取 Google Sheet 中狀態為「待發」且日期 <= 今天的列
-      → 若文案為空則用 Claude 生成
-      → 若有圖片從 Google Drive 下載並上傳到 FB
-      → 發文到一方石工作室粉絲專頁
-      → 回寫狀態、發文時間、FB Post ID
+      → 若 FB/Threads 文案為空則分別用 Claude 生成
+      → 若有圖片從 Google Drive 下載並上傳
+      → 發文到 FB 粉絲專頁 & Threads
+      → 回寫各自的狀態、發文時間、Post ID
 """
 
 import os
@@ -23,31 +23,41 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import anthropic
+from groq import Groq
 
 # 載入環境變數
 load_dotenv(Path(__file__).parent / ".env")
 
 FB_PAGE_ID = os.getenv("FB_PAGE_ID")
 FB_PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+THREADS_USER_ID = os.getenv("THREADS_USER_ID", "")
+THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN", "")
 
 SPREADSHEET_ID = "1rf4oOZ_QCTiGRTdc7yGU5-bQowMeirEMZFuM_oNN40s"
 CREDENTIALS_FILE = Path(__file__).parent / "google_credentials.json"
 TZ = ZoneInfo("Asia/Taipei")
 
 # 欄位索引（從 0 開始）
-COL_DATE = 0       # A 發文日期
-COL_TOPIC = 1      # B 主題
-COL_CONTENT = 2    # C 文案內容
-COL_STATUS = 3     # D 狀態
-COL_POSTED_AT = 4  # E 實際發文時間
-COL_POST_ID = 5    # F FB Post ID
-COL_IMAGE = 6      # G 圖片（Drive 網址或留空）
+COL_DATE = 0                  # A 發文日期
+COL_TOPIC = 1                 # B 主題
+COL_FB_CONTENT = 2            # C FB 文案
+COL_FB_STATUS = 3             # D FB 狀態
+COL_FB_POSTED_AT = 4          # E FB 發文時間
+COL_POST_ID = 5               # F FB Post ID
+COL_IMAGE = 6                 # G 圖片（Drive 網址或留空）
+COL_THREADS_CONTENT = 7       # H Threads 文案
+COL_THREADS_STATUS = 8        # I Threads 狀態
+COL_THREADS_POSTED_AT = 9     # J Threads 發文時間
+COL_THREADS_POST_ID = 10      # K Threads Post ID
 
-STYLE_NOTES = """品牌文案風格：結合「職人」「美學」「實用性」，強調職人質感。
+FB_STYLE_NOTES = """品牌文案風格：結合「職人」「美學」「實用性」，強調職人質感。
 語氣溫暖有個性，像朋友推薦而非廣告。台灣繁體中文，偶爾夾一兩個日文詞。
 不超過 200 字，結尾加 1~2 個 hashtag。中文遇英文或數字時加半形空格。"""
+
+THREADS_STYLE_NOTES = """品牌文案風格：結合「職人」「美學」「實用性」，強調職人質感。
+語氣更口語輕鬆，像朋友隨手分享。台灣繁體中文，不超過 150 字。
+結尾可加 1 個 hashtag 或完全不加，避免過多 hashtag。中文遇英文或數字時加半形空格。"""
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -117,17 +127,102 @@ def upload_photo_to_fb(image_bytes: bytes, mime_type: str) -> str:
     return result["id"]
 
 
-def generate_content(topic: str) -> str:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
+def generate_content(topic: str, platform: str = "fb") -> str:
+    client = Groq(api_key=GROQ_API_KEY)
+    if platform == "threads":
+        style = THREADS_STYLE_NOTES
+        platform_name = "Threads"
+    else:
+        style = FB_STYLE_NOTES
+        platform_name = "Facebook"
+    resp = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         max_tokens=512,
         messages=[{
             "role": "user",
-            "content": f"你是一方石工作室（Arrowrockman）的文案創作者。\n請針對「{topic}」寫一則 Facebook 貼文。\n{STYLE_NOTES}\n只輸出貼文內容，不要任何說明。"
+            "content": f"你是一方石工作室（Arrowrockman）的文案創作者。\n請針對「{topic}」寫一則 {platform_name} 貼文。\n{style}\n只輸出貼文內容，不要任何說明。"
         }],
     )
-    return msg.content[0].text.strip()
+    return resp.choices[0].message.content.strip()
+
+
+def drive_url_to_threads_url(url: str) -> str:
+    """將 Google Drive 分享連結轉換成 Threads 可直接存取的圖片網址"""
+    file_id = extract_drive_file_id(url)
+    if file_id:
+        return f"https://lh3.googleusercontent.com/d/{file_id}"
+    return url
+
+
+def post_to_threads(message: str, image_urls: list = None, dry_run: bool = False) -> dict:
+    """發文到 Threads（需先在 .env 設定 THREADS_USER_ID 與 THREADS_ACCESS_TOKEN）"""
+    if not THREADS_USER_ID or not THREADS_ACCESS_TOKEN:
+        return {"skipped": True, "reason": "Threads Token 尚未設定"}
+
+    base_url = f"https://graph.threads.net/v1.0/{THREADS_USER_ID}"
+
+    # 將 Drive 連結轉換成 lh3 直連格式
+    public_urls = [drive_url_to_threads_url(u) for u in (image_urls or [])]
+
+    if dry_run:
+        log(f"[DRY RUN] Threads 預計發文（{len(public_urls)} 張圖）：\n{message}")
+        return {"dry_run": True, "id": "dry_run_threads"}
+
+    # 有圖片：發 carousel 或單圖
+    if public_urls:
+        if len(public_urls) == 1:
+            resp = requests.post(f"{base_url}/threads", data={
+                "media_type": "IMAGE",
+                "image_url": public_urls[0],
+                "text": message,
+                "access_token": THREADS_ACCESS_TOKEN,
+            })
+            container_id = resp.json().get("id")
+            if not container_id:
+                return {"error": f"建立 container 失敗：{resp.json()}"}
+        else:
+            # 多圖 carousel
+            child_ids = []
+            for img_url in public_urls:
+                r = requests.post(f"{base_url}/threads", data={
+                    "media_type": "IMAGE",
+                    "image_url": img_url,
+                    "is_carousel_item": "true",
+                    "access_token": THREADS_ACCESS_TOKEN,
+                })
+                cid = r.json().get("id")
+                if cid:
+                    child_ids.append(cid)
+                else:
+                    log(f"Threads carousel 圖片失敗：{r.json()}，略過此圖")
+            if not child_ids:
+                return {"error": "所有圖片都無法建立 carousel item"}
+            resp = requests.post(f"{base_url}/threads", data={
+                "media_type": "CAROUSEL",
+                "children": ",".join(child_ids),
+                "text": message,
+                "access_token": THREADS_ACCESS_TOKEN,
+            })
+            container_id = resp.json().get("id")
+            if not container_id:
+                return {"error": f"建立 carousel container 失敗：{resp.json()}"}
+    else:
+        # 純文字
+        resp = requests.post(f"{base_url}/threads", data={
+            "media_type": "TEXT",
+            "text": message,
+            "access_token": THREADS_ACCESS_TOKEN,
+        })
+        container_id = resp.json().get("id")
+        if not container_id:
+            return {"error": f"建立 container 失敗：{resp.json()}"}
+
+    # 發布
+    pub_resp = requests.post(f"{base_url}/threads_publish", data={
+        "creation_id": container_id,
+        "access_token": THREADS_ACCESS_TOKEN,
+    })
+    return pub_resp.json()
 
 
 def post_to_facebook(message: str, photo_ids: list = None, dry_run: bool = False) -> dict:
@@ -162,69 +257,96 @@ def main():
 
         row_date_str = row[COL_DATE].strip()
         topic = row[COL_TOPIC].strip()
-        content = row[COL_CONTENT].strip()
-        status = row[COL_STATUS].strip()
+        fb_content = row[COL_FB_CONTENT].strip() if len(row) > COL_FB_CONTENT else ""
+        fb_status = row[COL_FB_STATUS].strip() if len(row) > COL_FB_STATUS else ""
         image_ref = row[COL_IMAGE].strip() if len(row) > COL_IMAGE else ""
+        threads_content = row[COL_THREADS_CONTENT].strip() if len(row) > COL_THREADS_CONTENT else ""
+        threads_status = row[COL_THREADS_STATUS].strip() if len(row) > COL_THREADS_STATUS else ""
 
-        if status != "待發":
+        # 兩個都已發，跳過整列
+        if fb_status == "已發" and threads_status in ("已發", "不發", "跳過"):
             continue
-
+        # 日期還沒到
         try:
             row_date = date.fromisoformat(row_date_str)
         except ValueError:
             log(f"第 {i} 列日期格式錯誤：{row_date_str}，跳過")
             continue
-
         if row_date > today:
             log(f"第 {i} 列日期 {row_date_str} 未到，跳過")
             continue
 
         log(f"處理第 {i} 列：{row_date_str} / {topic}")
 
-        # 生成文案
-        if not content or content == "（待填）":
-            log("文案為空，呼叫 Claude 生成...")
-            try:
-                content = generate_content(topic)
-                log(f"生成文案：{content[:80]}...")
-                ws.update_cell(i, COL_CONTENT + 1, content)
-            except Exception as e:
-                log(f"Claude 生成失敗：{e}，跳過此列")
-                continue
+        # 解析圖片連結（G 欄每行一個）
+        image_urls_raw = [u.strip() for u in image_ref.splitlines() if u.strip()]
 
-        # 處理圖片（G 欄可填多個 Drive 連結，每行一個）
-        photo_ids = []
-        if image_ref and not dry_run:
-            image_urls = [u.strip() for u in image_ref.splitlines() if u.strip()]
-            for img_url in image_urls:
-                file_id = extract_drive_file_id(img_url)
-                if file_id:
-                    log(f"下載 Drive 圖片：{file_id}")
-                    try:
-                        img_bytes, mime = download_from_drive(file_id)
-                        pid = upload_photo_to_fb(img_bytes, mime)
-                        photo_ids.append(pid)
-                        log(f"圖片上傳成功，photo_id: {pid}")
-                    except Exception as e:
-                        log(f"圖片處理失敗：{e}，略過此圖")
+        # ── FB 發文 ──────────────────────────────────────────
+        if fb_status != "已發":
+            if not fb_content or fb_content == "（待填）":
+                log("FB 文案為空，呼叫 Claude 生成...")
+                try:
+                    fb_content = generate_content(topic, platform="fb")
+                    log(f"FB 生成文案：{fb_content[:80]}...")
+                    ws.update_cell(i, COL_FB_CONTENT + 1, fb_content)
+                except Exception as e:
+                    log(f"FB Claude 生成失敗：{e}，跳過此列")
+                    continue
+
+            photo_ids = []
+            if image_urls_raw and not dry_run:
+                for img_url in image_urls_raw:
+                    file_id = extract_drive_file_id(img_url)
+                    if file_id:
+                        log(f"下載 Drive 圖片：{file_id}")
+                        try:
+                            img_bytes, mime = download_from_drive(file_id)
+                            pid = upload_photo_to_fb(img_bytes, mime)
+                            photo_ids.append(pid)
+                            log(f"圖片上傳 FB 成功，photo_id: {pid}")
+                        except Exception as e:
+                            log(f"圖片處理失敗：{e}，略過此圖")
+                    else:
+                        log(f"無法解析圖片連結：{img_url}，略過")
+
+            result = post_to_facebook(fb_content, photo_ids=photo_ids, dry_run=dry_run)
+            if "id" in result and not dry_run:
+                log(f"FB 發文成功！Post ID: {result['id']}")
+                ws.update_cell(i, COL_FB_STATUS + 1, "已發")
+                ws.update_cell(i, COL_FB_POSTED_AT + 1, now_str)
+                ws.update_cell(i, COL_POST_ID + 1, result["id"])
+                posted_count += 1
+            elif dry_run and "id" in result:
+                log("[DRY RUN] FB 完成，不寫回 Sheet")
+                posted_count += 1
+            else:
+                log(f"FB 發文失敗：{json.dumps(result, ensure_ascii=False)}")
+
+        # ── Threads 發文 ─────────────────────────────────────
+        if threads_status not in ("已發", "不發"):
+            if not threads_content or threads_content == "（待填）":
+                log("Threads 文案為空，呼叫 Claude 生成...")
+                try:
+                    threads_content = generate_content(topic, platform="threads")
+                    log(f"Threads 生成文案：{threads_content[:80]}...")
+                    ws.update_cell(i, COL_THREADS_CONTENT + 1, threads_content)
+                except Exception as e:
+                    log(f"Threads Claude 生成失敗：{e}，跳過")
+                    threads_content = ""
+
+            if threads_content:
+                t_result = post_to_threads(threads_content, image_urls=image_urls_raw, dry_run=dry_run)
+                if t_result.get("skipped"):
+                    log(f"Threads 跳過：{t_result['reason']}")
+                elif "id" in t_result and not dry_run:
+                    log(f"Threads 發文成功！Post ID: {t_result['id']}")
+                    ws.update_cell(i, COL_THREADS_STATUS + 1, "已發")
+                    ws.update_cell(i, COL_THREADS_POSTED_AT + 1, now_str)
+                    ws.update_cell(i, COL_THREADS_POST_ID + 1, t_result["id"])
+                elif dry_run and "id" in t_result:
+                    log("[DRY RUN] Threads 完成，不寫回 Sheet")
                 else:
-                    log(f"無法解析圖片連結：{img_url}，略過")
-
-        # 發文
-        result = post_to_facebook(content, photo_ids=photo_ids, dry_run=dry_run)
-
-        if "id" in result and not dry_run:
-            post_id = result["id"]
-            log(f"發文成功！Post ID: {post_id}")
-            ws.update_cell(i, COL_STATUS + 1, "已發")
-            ws.update_cell(i, COL_POSTED_AT + 1, now_str)
-            ws.update_cell(i, COL_POST_ID + 1, post_id)
-            posted_count += 1
-        elif dry_run and "id" in result:
-            log("[DRY RUN] 完成，不寫回 Sheet")
-            posted_count += 1
-        else:
-            log(f"發文失敗：{json.dumps(result, ensure_ascii=False)}")
+                    log(f"Threads 發文失敗：{json.dumps(t_result, ensure_ascii=False)}")
 
     log(f"=== 完成，共發出 {posted_count} 篇 ===\n")
 
