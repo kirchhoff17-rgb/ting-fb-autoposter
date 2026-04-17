@@ -272,8 +272,8 @@ def main():
         except ValueError:
             log(f"第 {i} 列日期格式錯誤：{row_date_str}，跳過")
             continue
-        if row_date > today:
-            log(f"第 {i} 列日期 {row_date_str} 未到，跳過")
+        if row_date != today:
+            log(f"第 {i} 列日期 {row_date_str} 非今天，跳過")
             continue
 
         log(f"處理第 {i} 列：{row_date_str} / {topic}")
